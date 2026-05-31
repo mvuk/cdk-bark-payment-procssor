@@ -25,6 +25,18 @@ pub struct BackendConfig {
     /// Data directory for SQLite database
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
+
+    /// Bitcoind RPC URL — used as the bark wallet's chain source (regtest)
+    #[serde(default = "default_bitcoind_address")]
+    pub bitcoind_address: String,
+
+    /// Bitcoind RPC user
+    #[serde(default = "default_bitcoind_user")]
+    pub bitcoind_user: String,
+
+    /// Bitcoind RPC password
+    #[serde(default = "default_bitcoind_pass")]
+    pub bitcoind_pass: String,
 }
 
 fn default_server_address() -> String {
@@ -43,6 +55,18 @@ fn default_data_dir() -> String {
     ".data/bark".to_string()
 }
 
+fn default_bitcoind_address() -> String {
+    "http://127.0.0.1:18443".to_string()
+}
+
+fn default_bitcoind_user() -> String {
+    "ark".to_string()
+}
+
+fn default_bitcoind_pass() -> String {
+    "ark".to_string()
+}
+
 impl Default for BackendConfig {
     fn default() -> Self {
         Self {
@@ -51,6 +75,9 @@ impl Default for BackendConfig {
             esplora_address: default_esplora_address(),
             network: default_network(),
             data_dir: default_data_dir(),
+            bitcoind_address: default_bitcoind_address(),
+            bitcoind_user: default_bitcoind_user(),
+            bitcoind_pass: default_bitcoind_pass(),
         }
     }
 }

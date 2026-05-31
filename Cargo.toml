@@ -12,9 +12,9 @@ async-trait = "0.1"
 bytes = "1"
 cdk-common = { git = "https://github.com/thesimplekid/cdk", branch = "onchain_bdk", default-features = false, features = ["mint", "grpc"] }
 cdk-payment-processor = { git = "https://github.com/thesimplekid/cdk", branch = "onchain_bdk", default-features = false }
-ark-lib = "0.1.4"
-bark-bitcoin-ext = "0.1.4"
-bark-wallet = { version = "0.1.4", features = ["onchain-bdk"] }
+ark-lib = { git = "https://gitlab.com/matthewvuk/shepherd.git" }
+bark-bitcoin-ext = { git = "https://gitlab.com/matthewvuk/shepherd.git" }
+bark-wallet = { git = "https://gitlab.com/matthewvuk/shepherd.git", features = ["onchain-bdk"] }
 bip39 = "2.0"
 bitcoin = "0.32"
 hex = "0.4"
