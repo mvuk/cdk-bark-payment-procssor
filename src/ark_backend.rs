@@ -10,7 +10,7 @@ use ark::lightning::PaymentHash;
 use ark::VtxoId;
 use async_trait::async_trait;
 use bark::onchain::bdk_wallet::TxOrdering;
-use bark::onchain::{ChainSync, GetWalletTx, OnchainWallet, PreparePsbt, SignPsbt};
+use bark::onchain::{ChainSync, GetAddress, GetWalletTx, OnchainWallet, PreparePsbt, SignPsbt};
 use bark::persist::sqlite::SqliteClient;
 use bark::persist::BarkPersister;
 use bitcoin::{Address, FeeRate, OutPoint, Psbt, Transaction, Txid};
@@ -612,8 +612,8 @@ impl PreparePsbt for ScopedBoard<'_> {
 
 #[async_trait]
 impl SignPsbt for ScopedBoard<'_> {
-    async fn finish_tx(&mut self, psbt: Psbt) -> anyhow::Result<Transaction> {
-        self.inner.finish_tx(psbt).await
+    async fn finish_psbt(&mut self, psbt: Psbt) -> anyhow::Result<Psbt> {
+        self.inner.finish_psbt(psbt).await
     }
 }
 
@@ -656,7 +656,10 @@ impl ArkBackend {
         // Build bark config
         let bark_config = bark::Config {
             server_address: config.server_address.clone(),
-            esplora_address: Some(config.esplora_address.clone()),
+            esplora_address: None,
+            bitcoind_address: Some(config.bitcoind_address.clone()),
+            bitcoind_user: Some(config.bitcoind_user.clone()),
+            bitcoind_pass: Some(config.bitcoind_pass.clone()),
             ..bark::Config::network_default(network)
         };
 
@@ -678,11 +681,12 @@ impl ArkBackend {
                 .map_err(|e| anyhow::anyhow!("Failed to load onchain wallet: {}", e))?;
 
         // Try to open existing wallet first, fall back to creating new one
-        let wallet = match bark::Wallet::open_with_onchain(
+        let wallet = match bark::Wallet::open(
             &mnemonic,
             db.clone(),
-            &onchain_wallet,
             bark_config.clone(),
+            bark::lock_manager::platform_default(&data_dir)
+                .map_err(|e| anyhow::anyhow!("Failed to init lock manager: {}", e))?,
         )
         .await
         {
@@ -692,12 +696,13 @@ impl ArkBackend {
             }
             Err(e) => {
                 info!("Creating new Ark wallet (open failed: {})", e);
-                bark::Wallet::create_with_onchain(
+                bark::Wallet::create(
                     &mnemonic,
                     network,
                     bark_config,
                     db,
-                    &onchain_wallet,
+                    bark::lock_manager::platform_default(&data_dir)
+                        .map_err(|e| anyhow::anyhow!("Failed to init lock manager: {}", e))?,
                     false,
                 )
                 .await
@@ -706,7 +711,7 @@ impl ArkBackend {
         };
 
         onchain_wallet
-            .sync(&wallet.chain)
+            .sync(&wallet.chain())
             .await
             .map_err(|e| anyhow::anyhow!("Failed to sync onchain wallet: {}", e))?;
 
@@ -746,12 +751,12 @@ impl ArkBackend {
             debug!("Failed to sync pending boards: {}", e);
         }
 
-        let tip = self.wallet.chain.tip().await.map_err(|e| {
+        let tip = self.wallet.chain().tip().await.map_err(|e| {
             cdk_common::payment::Error::Custom(format!("Failed to get chain tip: {}", e))
         })?;
 
         let mut onchain = self.onchain_wallet.lock().await;
-        onchain.sync(&self.wallet.chain).await.map_err(|e| {
+        onchain.sync(&self.wallet.chain()).await.map_err(|e| {
             cdk_common::payment::Error::Custom(format!("Failed to sync onchain wallet: {}", e))
         })?;
 
@@ -1257,7 +1262,7 @@ impl ArkBackend {
                         ))
                     })?;
 
-                    match self.wallet.chain.tx_status(parsed_txid).await {
+                    match self.wallet.chain().tx_status(parsed_txid).await {
                         Ok(bitcoin_ext::TxStatus::Confirmed(_)) => {
                             let mut confirmed = send.clone();
                             confirmed.state = OnchainSendIntentState::Confirmed {
@@ -1336,13 +1341,12 @@ impl ArkBackend {
             .check_lightning_payment(PaymentHash::from(payment_hash), false)
             .await
         {
-            Ok(Some(send)) => {
-                let updated = Self::lightning_intent_from_bark_send(intent, &send);
+            Ok(state) => {
+                let updated = Self::lightning_intent_from_bark_send(intent, &state);
                 self.state_store
                     .put_lightning_send(payment_hash_hex, &updated)?;
                 Ok(Some(updated))
             }
-            Ok(None) => Ok(Some(intent)),
             Err(e) => {
                 let now = Self::unix_now();
                 let mut updated = intent.clone();
@@ -1458,26 +1462,26 @@ impl ArkBackend {
 
     fn lightning_intent_from_bark_send(
         mut intent: LightningSendIntentRecord,
-        send: &bark::persist::models::LightningSend,
+        state: &bark::actions::lightning::pay::LightningSendState,
     ) -> LightningSendIntentRecord {
-        let fee_sat = send.fee.to_sat();
-        intent.amount_sat = send.amount.to_sat();
-        intent.state = match (&send.preimage, send.finished_at) {
-            (Some(preimage), Some(_)) => LightningSendIntentState::Paid {
-                fee_sat,
-                preimage: hex::encode(preimage.as_ref()),
-                paid_at: Self::unix_now(),
-            },
-            (None, Some(_)) => LightningSendIntentState::Failed {
-                reason: "Lightning payment failed".to_string(),
-                fee_sat: Some(fee_sat),
-                failed_at: Self::unix_now(),
-            },
-            _ => LightningSendIntentState::Pending {
-                fee_sat,
-                started_at: Self::unix_now(),
-            },
-        };
+        use bark::actions::lightning::pay::LightningSendState;
+        match state {
+            LightningSendState::Paid(paid) => {
+                intent.state = LightningSendIntentState::Paid {
+                    fee_sat: intent.estimated_fee_sat,
+                    preimage: hex::encode(paid.preimage.as_ref()),
+                    paid_at: Self::unix_now(),
+                };
+            }
+            LightningSendState::InProgress(send) => {
+                intent.amount_sat = send.payment_amount.to_sat();
+                intent.state = LightningSendIntentState::Pending {
+                    fee_sat: send.fee.to_sat(),
+                    started_at: Self::unix_now(),
+                };
+            }
+            LightningSendState::Unknown => {}
+        }
         intent
     }
 
@@ -1595,7 +1599,7 @@ impl MintPayment for ArkBackend {
             IncomingPaymentOptions::Onchain(opts) => {
                 let address = {
                     let mut onchain = self.onchain_wallet.lock().await;
-                    onchain.sync(&self.wallet.chain).await.map_err(|e| {
+                    onchain.sync(&self.wallet.chain()).await.map_err(|e| {
                         cdk_common::payment::Error::Custom(format!(
                             "Failed to sync onchain wallet: {}",
                             e
@@ -1928,45 +1932,51 @@ impl MintPayment for ArkBackend {
         self.state_store
             .put_lightning_send(&payment_hash_hex, &send_intent)?;
 
-        let lightning_send = match self
+        if let Err(e) = self
             .wallet
-            .pay_lightning_invoice(invoice_str.as_str(), None)
+            .pay_lightning_invoice(invoice_str.as_str(), None, false)
             .await
         {
-            Ok(lightning_send) => lightning_send,
-            Err(e) => {
-                let reason = e.to_string();
-                match self
-                    .wallet
-                    .check_lightning_payment(PaymentHash::from(payment_hash), false)
-                    .await
+            let reason = e.to_string();
+            match self
+                .wallet
+                .check_lightning_payment(PaymentHash::from(payment_hash), false)
+                .await
+            {
+                Ok(state)
+                    if !matches!(
+                        state,
+                        bark::actions::lightning::pay::LightningSendState::Unknown
+                    ) =>
                 {
-                    Ok(Some(recovered_send)) => {
-                        let recovered =
-                            Self::lightning_intent_from_bark_send(send_intent, &recovered_send);
-                        self.state_store
-                            .put_lightning_send(&payment_hash_hex, &recovered)?;
-                    }
-                    _ => {
-                        send_intent.state = LightningSendIntentState::NeedsReview {
-                            reason: format!(
-                                "Bark pay_lightning_invoice returned an error after the payment attempt was started: {}",
-                                reason
-                            ),
-                            failed_at: Self::unix_now(),
-                        };
-                        self.state_store
-                            .put_lightning_send(&payment_hash_hex, &send_intent)?;
-                    }
+                    let recovered = Self::lightning_intent_from_bark_send(send_intent, &state);
+                    self.state_store
+                        .put_lightning_send(&payment_hash_hex, &recovered)?;
                 }
-                return Err(cdk_common::payment::Error::Custom(format!(
-                    "Failed to pay invoice: {}",
-                    reason
-                )));
+                _ => {
+                    send_intent.state = LightningSendIntentState::NeedsReview {
+                        reason: format!(
+                            "Bark pay_lightning_invoice returned an error after the payment attempt was started: {}",
+                            reason
+                        ),
+                        failed_at: Self::unix_now(),
+                    };
+                    self.state_store
+                        .put_lightning_send(&payment_hash_hex, &send_intent)?;
+                }
             }
-        };
+            return Err(cdk_common::payment::Error::Custom(format!(
+                "Failed to pay invoice: {}",
+                reason
+            )));
+        }
 
-        let updated_send = Self::lightning_intent_from_bark_send(send_intent, &lightning_send);
+        let state = self
+            .wallet
+            .check_lightning_payment(PaymentHash::from(payment_hash), false)
+            .await
+            .unwrap_or(bark::actions::lightning::pay::LightningSendState::Unknown);
+        let updated_send = Self::lightning_intent_from_bark_send(send_intent, &state);
         self.state_store
             .put_lightning_send(&payment_hash_hex, &updated_send)?;
 
