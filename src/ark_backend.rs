@@ -28,7 +28,10 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use crate::payjoin_receiver::{BoardResult, PayjoinConfig, PayjoinReceiver};
+use crate::payjoin_state::{OnRampQuoteRecord, OnRampStateStore};
 use crate::settings::BackendConfig;
+use crate::telemetry::{OnRampEvent, OnRampStage, TelemetryClient};
 
 const ONCHAIN_CONFIRMATIONS: u32 = 1;
 const ONCHAIN_FEE_INDEX: u32 = 0;
@@ -41,9 +44,31 @@ pub struct ArkBackend {
     onchain_wallet: Arc<tokio::sync::Mutex<OnchainWallet>>,
     onchain_send_lock: Arc<tokio::sync::Mutex<()>>,
     lightning_send_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes all access to the bark wallet's sqlite between the board-poll loop
+    /// (`process_onchain_receive_boards`) and the payjoin board cosign
+    /// (`cosign_and_store_board`). Without this the 5s poll loop (esp. on long chains like
+    /// Mutinynet) can hold sqlite long enough to starve a cosign parked in a blocking rusqlite
+    /// call, defeating the cosign's 30s timeout. Hold ONLY around wallet/sqlite ops.
+    wallet_db_lock: Arc<tokio::sync::Mutex<()>>,
     state_store: Arc<ArkStateStore>,
     network: bitcoin::Network,
+    /// The Ark server's minimum board amount (sats), cached at startup from the server's
+    /// `ArkInfo`. A board (and therefore an on-chain/payjoin mint quote) below this amount will be
+    /// rejected by the server at cosign time, so we surface it to the CDK mint via
+    /// `OnchainSettings::min_receive_amount_sat`. The mint then refuses sub-minimum NUT-04 onchain
+    /// mint quotes at CREATION time (before any payjoin session/URI is issued), instead of taking
+    /// the payment and failing silently later in `cosign_and_store_board`.
+    min_board_amount_sat: u64,
     wait_invoice_active: Arc<AtomicBool>,
+    /// On-ramp payjoin receiver runner (on-chain -> ecash via board).
+    payjoin: PayjoinReceiver,
+    /// Real-events-only telemetry client.
+    telemetry: TelemetryClient,
+    /// UTXOs reserved by in-flight Tier 2 payjoin boards (mint input contribution). Shared with
+    /// the `PayjoinReceiver` so concurrent boards can't pick the same mint coin. Empty / unused
+    /// when `PAYJOIN_RECEIVER_INPUTS` is off.
+    #[allow(dead_code)]
+    payjoin_locked_utxos: Arc<tokio::sync::Mutex<std::collections::HashSet<OutPoint>>>,
 }
 
 const RECEIVE_ADDRESSES_TABLE: TableDefinition<&str, &str> =
@@ -653,13 +678,40 @@ impl ArkBackend {
             }
         };
 
-        // Build bark config
+        // Build bark config. Chain source selection: prefer Esplora when ESPLORA_ADDRESS is set
+        // (mainnet uses https://mempool.second.tech/api with NO local bitcoind); otherwise fall
+        // back to bitcoind for the local Mutinynet/regtest setup. bark (lib.rs:1051) picks Esplora
+        // whenever esplora_address.is_some(), else bitcoind, else bails — so only one is set.
+        let use_esplora = !config.esplora_address.trim().is_empty();
+        let esplora_address = use_esplora.then(|| config.esplora_address.clone());
+        let bitcoind_address = (!use_esplora).then(|| config.bitcoind_address.clone());
+        let (bitcoind_user, bitcoind_pass) = if use_esplora {
+            (None, None)
+        } else {
+            (
+                Some(config.bitcoind_user.clone()),
+                Some(config.bitcoind_pass.clone()),
+            )
+        };
+        // Ark server access token: mainnet ark.second.tech is token-gated. When set, bark sends it
+        // on the gRPC client (Config::server_access_token -> .access_token(..), lib.rs:1151).
+        // Empty/unset for local Mutinynet (no token required).
+        let server_access_token = {
+            let t = config.server_access_token.trim();
+            (!t.is_empty()).then(|| t.to_string())
+        };
+        if use_esplora {
+            info!("Chain source: Esplora ({})", config.esplora_address);
+        } else {
+            info!("Chain source: bitcoind ({})", config.bitcoind_address);
+        }
         let bark_config = bark::Config {
             server_address: config.server_address.clone(),
-            esplora_address: None,
-            bitcoind_address: Some(config.bitcoind_address.clone()),
-            bitcoind_user: Some(config.bitcoind_user.clone()),
-            bitcoind_pass: Some(config.bitcoind_pass.clone()),
+            server_access_token,
+            esplora_address,
+            bitcoind_address,
+            bitcoind_user,
+            bitcoind_pass,
             ..bark::Config::network_default(network)
         };
 
@@ -675,8 +727,22 @@ impl ArkBackend {
                 .map_err(|e| anyhow::anyhow!("Failed to open SQLite database: {}", e))?,
         );
 
+        // Give the bdk on-chain wallet its OWN sqlite file, separate from the bark VTXO
+        // wallet's db.sqlite. The two subsystems use disjoint tables (bark VTXO/movement
+        // state vs the bdk wallet changeset) and the processor passes the onchain wallet to
+        // bark methods as a parameter, never via a shared db connection. Splitting the file
+        // means the on-chain wallet's slow mempool sync no longer contends on a
+        // database-level write lock with the payjoin cosign. A fresh onchain.sqlite is fine:
+        // it's the payjoin fallback sink, starts empty, and re-syncs from tip via the
+        // set_birthday call below.
+        let onchain_db_path = data_dir.join("onchain.sqlite");
+        let onchain_db: Arc<dyn BarkPersister> = Arc::new(
+            SqliteClient::open(&onchain_db_path)
+                .map_err(|e| anyhow::anyhow!("Failed to open on-chain SQLite database: {}", e))?,
+        );
+
         let mut onchain_wallet =
-            OnchainWallet::load_or_create(network, mnemonic.to_seed(""), db.clone())
+            OnchainWallet::load_or_create(network, mnemonic.to_seed(""), onchain_db)
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to load onchain wallet: {}", e))?;
 
@@ -710,27 +776,345 @@ impl ArkBackend {
             }
         };
 
+        // For a freshly-created onchain wallet, seed a "birthday" checkpoint at
+        // the current chain tip so the first sync doesn't scan from genesis.
+        // On a long chain (e.g. Mutinynet) a genesis scan builds a multi-million
+        // entry LocalChain that makes is_block_in_chain pathologically slow and
+        // starves the board cosign loop. This is a no-op for an already-synced
+        // wallet. The processor only cosigns boards and never needs history.
+        onchain_wallet
+            .set_birthday(&wallet.chain())
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to set onchain wallet birthday: {}", e))?;
+
         onchain_wallet
             .sync(&wallet.chain())
             .await
             .map_err(|e| anyhow::anyhow!("Failed to sync onchain wallet: {}", e))?;
+
+        // Shared registry of UTXOs reserved by in-flight Tier 2 boards.
+        let payjoin_locked_utxos: Arc<tokio::sync::Mutex<std::collections::HashSet<OutPoint>>> =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
 
         let state_store = Arc::new(
             ArkStateStore::open(data_dir.join("onchain_state.redb"))
                 .map_err(|e| anyhow::anyhow!("Failed to open onchain state store: {}", e))?,
         );
 
+        // On-ramp payjoin state store (separate redb file).
+        let onramp_db = Arc::new(
+            Database::create(data_dir.join("onramp_state.redb"))
+                .map_err(|e| anyhow::anyhow!("Failed to open onramp state store: {}", e))?,
+        );
+        let onramp_store = OnRampStateStore::open(onramp_db)
+            .map_err(|e| anyhow::anyhow!("Failed to init onramp state store: {}", e))?;
+
+        // Startup prune of abandoned on-ramp sessions (comma-separated quote ids in
+        // ONRAMP_PRUNE_QUOTES). Never-paid test sessions otherwise consume the sequential poll
+        // budget (~5s OHTTP each), starving live boards. Safe: removes only the listed ids.
+        if let Ok(prune_ids) = std::env::var("ONRAMP_PRUNE_QUOTES") {
+            for id in prune_ids.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                match onramp_store.remove_quote(id) {
+                    Ok(()) => tracing::info!("onramp prune: removed stale quote {}", id),
+                    Err(e) => tracing::warn!("onramp prune: failed to remove {}: {}", id, e),
+                }
+            }
+        }
+
+        // Log the mint's on-chain receive address so the wallet can be funded for Tier 2 payjoin
+        // boarding (the mint contributing its OWN input). We derive via `address()`, which uses
+        // bdk `reveal_next_address` (monotonic, single-use) — never `next_unused_address` — so an
+        // advertised funding script is never reused. We additionally record the derived script in
+        // the no-address-reuse guard, which logs a warning if a script was ever advertised before.
+        match onchain_wallet.address().await {
+            Ok(addr) => {
+                info!("Mint on-chain wallet receive address: {}", addr);
+                let script_hex = hex::encode(addr.script_pubkey().as_bytes());
+                if let Err(e) =
+                    onramp_store.record_advertised_script(&script_hex, "mint-onchain-receive")
+                {
+                    warn!("payjoin single-use guard: {e}");
+                }
+            }
+            Err(e) => warn!("Could not derive mint on-chain receive address: {}", e),
+        }
+
+        // Wrap the onchain wallet in its shared Arc<Mutex> now so the same handle backs both the
+        // backend and the payjoin receiver (Tier 2 input sourcing + signing).
+        let onchain_wallet: Arc<tokio::sync::Mutex<OnchainWallet>> =
+            Arc::new(tokio::sync::Mutex::new(onchain_wallet));
+
+        // Resolve OHTTP keys: parse from config if present, else fetch from the directory
+        // via the relay. A failure here is non-fatal: the on-ramp simply can't create sessions
+        // until keys are available.
+        let ohttp_keys = if config.payjoin_ohttp_keys.trim().is_empty() {
+            match payjoin::io::fetch_ohttp_keys(
+                config.payjoin_ohttp_relay.clone(),
+                config.payjoin_directory_url.clone(),
+            )
+            .await
+            {
+                Ok(keys) => Some(keys),
+                Err(e) => {
+                    warn!("Failed to fetch payjoin OHTTP keys (on-ramp disabled until available): {e}");
+                    None
+                }
+            }
+        } else {
+            // Configured keys are a hex-encoded OHTTP KeyConfig (the wire form decoded by
+            // `OhttpKeys::decode`). The bech32 `OH1...` `FromStr` path is test-only upstream, so
+            // we accept the hex form here for a stable, public decode path.
+            match hex::decode(config.payjoin_ohttp_keys.trim())
+                .map_err(|e| e.to_string())
+                .and_then(|bytes| {
+                    payjoin::OhttpKeys::decode(&bytes).map_err(|e| e.to_string())
+                }) {
+                Ok(keys) => Some(keys),
+                Err(e) => {
+                    warn!("Invalid configured payjoin OHTTP keys (expected hex KeyConfig; on-ramp disabled): {e}");
+                    None
+                }
+            }
+        };
+
+        // Tier 2 payjoin boarding flag: when on, the mint contributes its OWN on-chain input(s) to
+        // the board (real multi-input payjoin); when off (default) boards are zero-receiver-input
+        // (Tier 3, unchanged historical behavior).
+        if config.payjoin_receiver_inputs {
+            info!(
+                "Payjoin receiver inputs (Tier 2) ENABLED: mint will contribute up to {} of its own \
+                 on-chain input(s) per board (PAYJOIN_RECEIVER_INPUTS=1)",
+                config.payjoin_receiver_input_count
+            );
+        } else {
+            info!("Payjoin receiver inputs (Tier 2) DISABLED: zero-input boards (Tier 3). Set PAYJOIN_RECEIVER_INPUTS=1 to enable");
+        }
+
+        let telemetry = TelemetryClient::new(config.control_url.clone());
+        // Fetch the Ark server's minimum board amount at startup. This is the same value the
+        // server enforces inside `cosign_and_store_board`; surfacing it here lets the CDK mint
+        // reject sub-minimum on-chain (payjoin board) mint quotes at creation time rather than
+        // issuing a payjoin URI, taking the payment, and failing silently at cosign.
+        //
+        // We MUST NOT default this to 1 on failure: a 1-sat floor silently admits sub-minimum
+        // boards that the server later rejects at cosign, stranding the depositor's funds (the A4
+        // path). Instead we gate startup on Ark reachability with a BOUNDED retry: poll
+        // require_ark_info every 5s for up to ~2 min, then hard-fail (refuse to start) if the
+        // server never answers. systemd's Restart=on-failure will retry — far better than coming
+        // up with a wrong floor. Bounded so a hang is impossible (timeout discipline).
+        let min_board_amount_sat = {
+            const RETRY_INTERVAL: Duration = Duration::from_secs(5);
+            const MAX_WAIT: Duration = Duration::from_secs(120);
+            let deadline = std::time::Instant::now() + MAX_WAIT;
+            loop {
+                match wallet.require_ark_info().await {
+                    Ok(ark_info) => {
+                        let min = ark_info.min_board_amount.to_sat();
+                        info!("Ark server minimum board amount: {} sat", min);
+                        break min;
+                    }
+                    Err(e) => {
+                        if std::time::Instant::now() >= deadline {
+                            return Err(anyhow::anyhow!(
+                                "Ark server unreachable: could not fetch min_board_amount after {}s \
+                                 (last error: {}); refusing to start rather than defaulting the \
+                                 board floor to 1 sat (would strand sub-minimum deposits)",
+                                MAX_WAIT.as_secs(),
+                                e
+                            ));
+                        }
+                        warn!(
+                            "Ark server min_board_amount not yet available ({}); retrying in {}s \
+                             (bounded, will hard-fail at {}s total)",
+                            e,
+                            RETRY_INTERVAL.as_secs(),
+                            MAX_WAIT.as_secs()
+                        );
+                        tokio::time::sleep(RETRY_INTERVAL).await;
+                    }
+                }
+            }
+        };
+
+        let payjoin = PayjoinReceiver::new(
+            PayjoinConfig {
+                directory_url: config.payjoin_directory_url.clone(),
+                ohttp_relay: config.payjoin_ohttp_relay.clone(),
+                ohttp_keys,
+                control_url: config.control_url.clone(),
+            },
+            onramp_store,
+            telemetry.clone(),
+            config.payjoin_receiver_inputs,
+            config.payjoin_receiver_input_count,
+            onchain_wallet.clone(),
+            payjoin_locked_utxos.clone(),
+            min_board_amount_sat,
+            config.payjoin_onchain_deposit_fee_bps,
+        );
+
         info!("Ark backend initialized successfully");
 
         Ok(Self {
             wallet: Arc::new(wallet),
-            onchain_wallet: Arc::new(tokio::sync::Mutex::new(onchain_wallet)),
+            onchain_wallet,
             onchain_send_lock: Arc::new(tokio::sync::Mutex::new(())),
             lightning_send_lock: Arc::new(tokio::sync::Mutex::new(())),
+            wallet_db_lock: Arc::new(tokio::sync::Mutex::new(())),
             state_store,
             network,
+            min_board_amount_sat,
             wait_invoice_active: Arc::new(AtomicBool::new(false)),
+            payjoin,
+            telemetry,
+            payjoin_locked_utxos,
         })
+    }
+
+    /// Drive all active payjoin on-ramp sessions forward one step. Intended to be called on a
+    /// timer from the service startup (see `main.rs`). Errors per-session are logged and do not
+    /// abort the loop.
+    pub async fn poll_onramp(&self) {
+        let results = self
+            .payjoin
+            .poll_all(&self.wallet, &self.wallet_db_lock)
+            .await;
+        for (quote_id, res) in results {
+            match res {
+                Ok(BoardResult::Boarded {
+                    board_txid,
+                    net_sat,
+                    deposit_outpoint,
+                    gross_sat,
+                    board_vtxo_ids,
+                }) => {
+                    // The payjoin path cosigns + stores the board directly and never goes through
+                    // the legacy `board_all` flow, so it never creates a `Boarding` receive intent.
+                    // Persist one here so the existing finalize -> check_onchain_receive ->
+                    // PaymentReceived machinery credits the quote once the board VTXOs become
+                    // spendable. Idempotent: skip if an intent for this outpoint already exists.
+                    if let Err(e) = self.record_payjoin_boarding_intent(
+                        &quote_id,
+                        deposit_outpoint,
+                        board_txid,
+                        gross_sat,
+                        net_sat,
+                        board_vtxo_ids,
+                    ) {
+                        warn!("payjoin {quote_id}: failed to record boarding intent: {e}");
+                    }
+                }
+                Ok(_) => {}
+                // A real cosign/board failure (e.g. the server rejecting the board as below its
+                // minimum board amount) bubbles up here from `advance_session`/`drive_from_state`.
+                // Log it at `warn!` (visible at default RUST_LOG=info) with the quote_id and full
+                // error so the failure surfaces instead of looking like a silent hang.
+                Err(e) => warn!("payjoin on-ramp board failed for quote {quote_id}: {e:#}"),
+            }
+        }
+        // After advancing sessions, run the existing board detect/finalize machinery so confirmed
+        // boards become spendable and are surfaced for crediting.
+        if let Err(e) = self.process_onchain_receive_boards().await {
+            debug!("on-ramp board reconcile error: {e}");
+        }
+    }
+
+    /// Clone of the payjoin receiver for external poll loops.
+    pub fn payjoin_receiver(&self) -> PayjoinReceiver {
+        self.payjoin.clone()
+    }
+
+    /// Periodic bark wallet maintenance. VTXOs expire after `vtxo_lifetime` blocks; any custody
+    /// VTXO (the funds backing issued ecash) not refreshed before expiry can only be recovered
+    /// via an expensive unilateral exit. `maintenance_delegated` schedules refresh rounds with
+    /// the server for VTXOs inside the refresh threshold without blocking on round completion.
+    /// Intended to be called on a timer from `main.rs`; must run well inside the bark refresh
+    /// threshold (12 blocks = ~6 min on Mutinynet's 30s blocks, 144 blocks = 24h on mainnet).
+    pub async fn run_maintenance(&self) -> anyhow::Result<()> {
+        // Same lock discipline as the other wallet/sqlite ops: hold `wallet_db_lock` only
+        // around the bark wallet call so a payjoin cosign is never starved.
+        let _wallet_db_guard = self.wallet_db_lock.lock().await;
+        self.wallet.maintenance_delegated().await
+    }
+
+    /// One-shot manual offboard, env-gated from `main.rs` (`RECYCLER_TEST_OFFBOARD_SAT`). Offboards
+    /// `amount_sat` of the mint's Ark reserve to a FRESH on-chain bdk address. This validates the
+    /// recycler primitive on mainnet (and reveals offboard confirmation timing) BEFORE any
+    /// unattended loop is wired. SAFE only while total VTXO value stays well above the
+    /// outstanding-ecash liability — the caller picks a small amount well inside the mint's OWN
+    /// reserve. Funds are not lost: they move Ark -> the mint's own on-chain wallet (the float).
+    pub async fn recycle_test_offboard(&self, amount_sat: u64) -> anyhow::Result<Txid> {
+        let dest = {
+            let mut oc = self.onchain_wallet.lock().await;
+            oc.address().await?
+        };
+        tracing::warn!(
+            "recycle TEST offboard: moving {} sat Ark reserve -> fresh on-chain {}",
+            amount_sat,
+            dest
+        );
+        let _wallet_db_guard = self.wallet_db_lock.lock().await;
+        let txid = self
+            .wallet
+            .send_onchain(dest, bitcoin::Amount::from_sat(amount_sat))
+            .await?;
+        tracing::warn!("recycle TEST offboard: send_onchain -> txid {}", txid);
+        Ok(txid)
+    }
+
+    /// Split the mint's on-chain (bdk) reserve into many small **randomized** UTXOs (each in
+    /// `[min_sat, max_sat]`), to FRESH addresses, in a single self-send tx. This is what turns a
+    /// lump reserve into a stream of small lend denominations: with `PAYJOIN_RECEIVER_INPUT_COUNT=1`
+    /// each Tier-2 board then contributes one of these small coins, so the lend per board is a
+    /// random 5–20k. No funds leave the mint (mint -> its own fresh addresses); the only cost is the
+    /// miner fee. Randomness is system-seeded (unpredictable to a chain observer; not crypto-grade,
+    /// which is fine for amount jitter). Env-gated one-shot via `RECYCLER_SPLIT_NOW` in main.rs.
+    pub async fn split_reserve(&self, min_sat: u64, max_sat: u64) -> anyhow::Result<Txid> {
+        use std::hash::{BuildHasher, Hasher};
+        let _wallet_db_guard = self.wallet_db_lock.lock().await;
+        let mut oc = self.onchain_wallet.lock().await;
+        let spendable = oc.balance().confirmed.to_sat();
+        let fee_margin: u64 = 3000; // leave room for the miner fee; remainder becomes a small change UTXO
+        anyhow::ensure!(
+            spendable > min_sat + fee_margin,
+            "reserve too small to split ({} sat)",
+            spendable
+        );
+        let mut dests: Vec<(Address, bitcoin::Amount)> = Vec::new();
+        let mut allocated: u64 = 0;
+        let mut i: u64 = 0;
+        loop {
+            let remaining = spendable.saturating_sub(allocated);
+            let hi = std::cmp::min(max_sat, remaining.saturating_sub(fee_margin));
+            if hi < min_sat || dests.len() >= 60 {
+                break;
+            }
+            // system-seeded unpredictable amount in [min_sat, hi]
+            let s = std::collections::hash_map::RandomState::new();
+            let mut h = s.build_hasher();
+            h.write_u64(i);
+            h.write_u64(allocated);
+            let amt = min_sat + (h.finish() % (hi - min_sat + 1));
+            let addr = oc.address().await?;
+            dests.push((addr, bitcoin::Amount::from_sat(amt)));
+            allocated += amt;
+            i += 1;
+        }
+        anyhow::ensure!(!dests.is_empty(), "no split destinations generated");
+        let feerate = FeeRate::from_sat_per_vb(2).unwrap_or(FeeRate::BROADCAST_MIN);
+        tracing::warn!(
+            "split_reserve: splitting {} sat of {} reserve into {} randomized UTXOs ({}-{} sat each)",
+            allocated,
+            spendable,
+            dests.len(),
+            min_sat,
+            max_sat
+        );
+        let txid = oc
+            .send_many(&self.wallet.chain(), &dests, feerate)
+            .await?;
+        tracing::warn!("split_reserve: broadcast split tx {} ({} outputs)", txid, dests.len());
+        Ok(txid)
     }
 
     fn parse_bitcoin_address(
@@ -747,17 +1131,27 @@ impl ArkBackend {
     }
 
     async fn process_onchain_receive_boards(&self) -> Result<(), cdk_common::payment::Error> {
+        // Sync the on-chain (bdk) wallet FIRST, WITHOUT holding `wallet_db_lock`. The on-chain
+        // wallet now persists to its own onchain.sqlite (separate file from the bark VTXO
+        // db.sqlite), so this slow mempool sync no longer touches the sqlite the payjoin board
+        // cosign uses — holding `wallet_db_lock` across it would park the cosign behind the sync
+        // for no reason. `onchain_wallet` is locked ONLY here (no other code path acquires it), so
+        // taking it before `wallet_db_lock` cannot invert any lock order.
+        let mut onchain = self.onchain_wallet.lock().await;
+        onchain.sync(&self.wallet.chain()).await.map_err(|e| {
+            cdk_common::payment::Error::Custom(format!("Failed to sync onchain wallet: {}", e))
+        })?;
+
+        // Everything below touches the bark VTXO sqlite (db.sqlite); serialize it against the
+        // cosign by holding `wallet_db_lock` for these (fast) bark-db operations only.
+        let _wallet_db_guard = self.wallet_db_lock.lock().await;
+
         if let Err(e) = self.wallet.sync_pending_boards().await {
             debug!("Failed to sync pending boards: {}", e);
         }
 
         let tip = self.wallet.chain().tip().await.map_err(|e| {
             cdk_common::payment::Error::Custom(format!("Failed to get chain tip: {}", e))
-        })?;
-
-        let mut onchain = self.onchain_wallet.lock().await;
-        onchain.sync(&self.wallet.chain()).await.map_err(|e| {
-            cdk_common::payment::Error::Custom(format!("Failed to sync onchain wallet: {}", e))
         })?;
 
         self.recover_preparing_receive_boards(&onchain).await?;
@@ -1049,6 +1443,24 @@ impl ArkBackend {
                 "Finalized onchain receive {} for quote {} after board {} became spendable",
                 finalized.deposit_outpoint, finalized.quote_id, board_txid
             );
+
+            // REAL event: the board funding tx confirmed and the VTXO became spendable, growing
+            // the mint reserve by the boarded amount.
+            if self
+                .payjoin
+                .state
+                .get_quote(&finalized.quote_id)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                self.telemetry.emit(
+                    OnRampEvent::new(&finalized.quote_id, OnRampStage::BoardConfirmed)
+                        .with_board_txid(board_txid)
+                        .with_vtxo_amount_sat(*amount_sat)
+                        .with_vtxo_ids(board_vtxo_ids.clone()),
+                );
+            }
         }
 
         Ok(())
@@ -1094,6 +1506,52 @@ impl ArkBackend {
         intent
     }
 
+    /// Persist a `Boarding` onchain receive intent for a payjoin board that was cosigned + stored
+    /// directly by the payjoin receiver (which bypasses the legacy `board_all` flow). This makes
+    /// the existing `finalize_spendable_receive_boards` -> `check_onchain_receive` ->
+    /// `Event::PaymentReceived` machinery credit the quote once the board VTXOs become spendable.
+    ///
+    /// Idempotent: if an intent already exists for `deposit_outpoint`, it is left untouched so we
+    /// never overwrite a later state (e.g. `Finalized`) or re-credit.
+    fn record_payjoin_boarding_intent(
+        &self,
+        quote_id: &str,
+        deposit_outpoint: String,
+        board_txid: String,
+        gross_sat: u64,
+        amount_sat: u64,
+        board_vtxo_ids: Vec<String>,
+    ) -> Result<(), cdk_common::payment::Error> {
+        if self
+            .state_store
+            .get_receive_intent(&deposit_outpoint)?
+            .is_some()
+        {
+            return Ok(());
+        }
+
+        let fee_sat = gross_sat.saturating_sub(amount_sat);
+        let intent = OnchainReceiveIntentRecord {
+            quote_id: quote_id.to_string(),
+            deposit_outpoint,
+            gross_sat,
+            state: OnchainReceiveIntentState::Boarding {
+                attempt: 1,
+                board_txid,
+                board_vtxo_ids,
+                fee_sat,
+                amount_sat,
+                started_at: Self::unix_now(),
+            },
+        };
+        self.state_store.put_receive_intent(&intent)?;
+        info!(
+            "Recorded payjoin board intent {} for quote {}: gross {} sat, net {} sat",
+            intent.deposit_outpoint, intent.quote_id, intent.gross_sat, amount_sat
+        );
+        Ok(())
+    }
+
     async fn check_onchain_receive(
         &self,
         quote_id: &QuoteId,
@@ -1114,27 +1572,41 @@ impl ArkBackend {
                 else {
                     return None;
                 };
-
-                Some((
-                    receive.deposit_outpoint,
-                    WaitPaymentResponse {
-                        payment_identifier: PaymentIdentifier::QuoteId(quote_id.clone()),
-                        payment_amount: Amount::new(amount_sat, CurrencyUnit::Sat),
-                        payment_id: board_txid,
-                    },
-                ))
+                Some((receive.deposit_outpoint, board_txid, amount_sat))
             })
             .collect::<Vec<_>>();
 
         if mark_reported && !responses.is_empty() {
-            for (outpoint, _) in &responses {
+            // This is the polling path the mint uses to credit ONCHAIN quotes (the
+            // wait_payment_event stream only runs for bolt11). Emit the ecash_issued
+            // telemetry here too — gated on this being an on-ramp quote — so the
+            // dashboard's final stage + the user's ecash balance animate on a real credit.
+            let is_onramp = self
+                .payjoin
+                .state
+                .get_quote(&quote_id.to_string())
+                .ok()
+                .flatten()
+                .is_some();
+            for (outpoint, board_txid, amount_sat) in &responses {
                 self.state_store.mark_receive_reported(outpoint)?;
+                if is_onramp {
+                    self.telemetry.emit(
+                        OnRampEvent::new(&quote_id.to_string(), OnRampStage::EcashIssued)
+                            .with_board_txid(board_txid)
+                            .with_ecash_amount_sat(*amount_sat),
+                    );
+                }
             }
         }
 
         Ok(responses
             .into_iter()
-            .map(|(_, response)| response)
+            .map(|(_, board_txid, amount_sat)| WaitPaymentResponse {
+                payment_identifier: PaymentIdentifier::QuoteId(quote_id.clone()),
+                payment_amount: Amount::new(amount_sat, CurrencyUnit::Sat),
+                payment_id: board_txid,
+            })
             .collect())
     }
 
@@ -1165,6 +1637,23 @@ impl ArkBackend {
 
         self.state_store
             .mark_receive_reported(&receive.deposit_outpoint)?;
+
+        // REAL event: the mint is being credited (PaymentReceived emitted) for this on-ramp quote,
+        // so the user's ecash balance grows by the net boarded amount.
+        if self
+            .payjoin
+            .state
+            .get_quote(&receive.quote_id)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            self.telemetry.emit(
+                OnRampEvent::new(&receive.quote_id, OnRampStage::EcashIssued)
+                    .with_board_txid(&board_txid)
+                    .with_ecash_amount_sat(amount_sat),
+            );
+        }
 
         Ok(Some(Event::PaymentReceived(WaitPaymentResponse {
             payment_identifier: PaymentIdentifier::QuoteId(quote_id),
@@ -1230,6 +1719,10 @@ impl ArkBackend {
     }
 
     async fn reconcile_onchain_sends(&self) -> Result<(), cdk_common::payment::Error> {
+        // Serialize bark-wallet sqlite/state access against the payjoin board cosign and the
+        // board-poll loop. Held across the offboard sync and the per-send tx_status checks.
+        let _wallet_db_guard = self.wallet_db_lock.lock().await;
+
         if let Err(e) = self.wallet.sync_pending_offboards().await {
             debug!("Failed to sync pending offboards: {}", e);
         }
@@ -1336,11 +1829,14 @@ impl ArkBackend {
         };
 
         let payment_hash = Self::parse_payment_hash_hex(payment_hash_hex)?;
-        match self
-            .wallet
-            .check_lightning_payment(PaymentHash::from(payment_hash), false)
-            .await
-        {
+        // Serialize the bark-wallet sqlite/state read against the cosign and poll loop.
+        let bark_result = {
+            let _wallet_db_guard = self.wallet_db_lock.lock().await;
+            self.wallet
+                .check_lightning_payment(PaymentHash::from(payment_hash), false)
+                .await
+        };
+        match bark_result {
             Ok(state) => {
                 let updated = Self::lightning_intent_from_bark_send(intent, &state);
                 self.state_store
@@ -1525,13 +2021,19 @@ impl ArkBackend {
         payment_hash: PaymentHash,
         mark_reported: bool,
     ) -> Result<Vec<WaitPaymentResponse>, cdk_common::payment::Error> {
-        let receive = self
-            .wallet
-            .lightning_receive_status(payment_hash)
-            .await
-            .map_err(|e| {
-                cdk_common::payment::Error::Custom(format!("Failed to check receive status: {}", e))
-            })?;
+        let receive = {
+            // Serialize the bark-wallet sqlite/state read against the cosign and poll loop.
+            let _wallet_db_guard = self.wallet_db_lock.lock().await;
+            self.wallet
+                .lightning_receive_status(payment_hash)
+                .await
+                .map_err(|e| {
+                    cdk_common::payment::Error::Custom(format!(
+                        "Failed to check receive status: {}",
+                        e
+                    ))
+                })?
+        };
 
         if let Some(receive) = receive {
             if receive.finished_at.is_some() {
@@ -1581,7 +2083,13 @@ impl MintPayment for ArkBackend {
             bolt12: None,
             onchain: Some(OnchainSettings {
                 confirmations: ONCHAIN_CONFIRMATIONS,
-                min_receive_amount_sat: 1,
+                // Advertise the Ark server's minimum board amount as the minimum on-chain
+                // (payjoin board) receive amount. The CDK mint clamps NUT-04 onchain mint quotes
+                // to this minimum and rejects sub-minimum quotes at CREATION time with
+                // `Error::AmountOutofLimitRange`, before `create_incoming_payment_request` issues a
+                // payjoin URI. Without this, a sub-minimum quote would be accepted, paid, and then
+                // fail silently in `cosign_and_store_board`.
+                min_receive_amount_sat: self.min_board_amount_sat,
                 min_send_amount_sat: 1,
             }),
             custom: Default::default(),
@@ -1597,39 +2105,110 @@ impl MintPayment for ArkBackend {
         let bolt11_options = match options {
             IncomingPaymentOptions::Bolt11(opts) => Some(opts),
             IncomingPaymentOptions::Onchain(opts) => {
-                let address = {
-                    let mut onchain = self.onchain_wallet.lock().await;
-                    onchain.sync(&self.wallet.chain()).await.map_err(|e| {
+                // PAYJOIN on-ramp: derive a per-quote board user keypair, get the board funding
+                // P2TR address/script, start a payjoin v2 receiver session whose receiver output
+                // is the board funding script, and return a BIP21+pj URI advertising output
+                // substitution ENABLED. We MUST echo the mint-supplied quote_id verbatim.
+                let quote_id = opts.quote_id;
+                let quote_id_str = quote_id.to_string();
+
+                // Derive + persist a fresh keypair index (re-derivable across restarts via
+                // peak_keypair) and the board funding address/expiry for this quote.
+                // Serialize the bark-wallet sqlite/state access (keypair derive+store and board
+                // funding address derivation) against the cosign and poll loop. Released before the
+                // payjoin session / network work below.
+                let (user_keypair, keypair_index, board_address, expiry_height) = {
+                    let _wallet_db_guard = self.wallet_db_lock.lock().await;
+                    let (user_keypair, keypair_index) =
+                        self.wallet.derive_store_next_keypair().await.map_err(|e| {
+                            cdk_common::payment::Error::Custom(format!(
+                                "Failed to derive board keypair: {}",
+                                e
+                            ))
+                        })?;
+                    let (board_address, expiry_height) = self
+                        .wallet
+                        .board_funding_address(&user_keypair)
+                        .await
+                        .map_err(|e| {
+                            cdk_common::payment::Error::Custom(format!(
+                                "Failed to derive board funding address: {}",
+                                e
+                            ))
+                        })?;
+                    (user_keypair, keypair_index, board_address, expiry_height)
+                };
+                let board_script = board_address.script_pubkey();
+                let board_address_str = board_address.to_string();
+
+                // No-address-reuse invariant (explicit, not incidental): the per-quote board
+                // funding script is derived from a freshly advanced, monotonic keypair index
+                // (`derive_store_next_keypair`) — never a "next unused" lookup — so it is single-use
+                // by construction. We additionally record it in the advertised-scripts guard, which
+                // refuses (errors) if this exact script was ever handed out before. A violation here
+                // means a reuse bug, so we surface it loudly and abort the quote rather than risk
+                // advertising a reused address.
+                {
+                    let script_hex = hex::encode(board_script.as_bytes());
+                    self.payjoin
+                        .state
+                        .record_advertised_script(&script_hex, &format!("board:{quote_id_str}"))
+                        .map_err(|e| {
+                            cdk_common::payment::Error::Custom(format!(
+                                "no-address-reuse guard rejected board script for quote {quote_id_str}: {e}"
+                            ))
+                        })?;
+                }
+
+                // Start the payjoin session and obtain the advertised URI.
+                let bip21_uri = self
+                    .payjoin
+                    .create_session(&quote_id_str, &board_address)
+                    .map_err(|e| {
                         cdk_common::payment::Error::Custom(format!(
-                            "Failed to sync onchain wallet: {}",
+                            "Failed to create payjoin session: {}",
                             e
                         ))
                     })?;
-                    onchain.address().await.map_err(|e| {
-                        cdk_common::payment::Error::Custom(format!(
-                            "Failed to create onchain address: {}",
-                            e
-                        ))
-                    })?
-                };
 
-                let quote_id = opts.quote_id;
-                let quote_id_str = quote_id.to_string();
-                let address_str = address.to_string();
+                let record = OnRampQuoteRecord {
+                    quote_id: quote_id_str.clone(),
+                    keypair_index,
+                    expiry_height,
+                    board_script_hex: hex::encode(board_script.as_bytes()),
+                    board_address: board_address_str.clone(),
+                    bip21_uri: bip21_uri.clone(),
+                };
+                self.payjoin
+                    .state
+                    .put_quote(&record)
+                    .map_err(|e| cdk_common::payment::Error::Custom(e.to_string()))?;
+
+                // Also register the board funding address in the legacy receive-address table so
+                // the existing detect/finalize crediting machinery treats this board's confirmed
+                // funding output as a receive for this quote.
                 self.state_store
-                    .put_receive_address(&quote_id_str, &address_str)?;
+                    .put_receive_address(&quote_id_str, &board_address_str)?;
 
                 info!(
-                    "Created onchain receive address {} for quote {}",
-                    address_str, quote_id
+                    "Created onchain payjoin on-ramp for quote {}: board address {}, expiry {}",
+                    quote_id, board_address_str, expiry_height
+                );
+
+                // REAL event: the quote (and board address) was genuinely created.
+                self.telemetry.emit(
+                    OnRampEvent::new(&quote_id_str, OnRampStage::QuoteCreated)
+                        .with_board_address(&board_address_str),
                 );
 
                 return Ok(CreateIncomingPaymentResponse {
                     request_lookup_id: PaymentIdentifier::QuoteId(quote_id),
-                    request: address_str,
+                    request: bip21_uri,
                     expiry: None,
                     extra_json: Some(serde_json::json!({
                         "fee_policy": "bark_board_fee_deducted_from_received_amount",
+                        "onramp": "payjoin_board",
+                        "board_address": board_address_str,
                     })),
                 });
             }
@@ -1647,14 +2226,17 @@ impl MintPayment for ArkBackend {
         // Convert amount to bitcoin::Amount - use to_u64() to get raw value from Amount<()>
         let amount = bitcoin::Amount::from_sat(bolt11_options.amount.to_u64());
 
-        // Generate BOLT11 invoice using bark wallet
-        let invoice = self
-            .wallet
-            .bolt11_invoice(amount, bolt11_options.description)
-            .await
-            .map_err(|e| {
-                cdk_common::payment::Error::Custom(format!("Failed to create invoice: {}", e))
-            })?;
+        // Generate BOLT11 invoice using bark wallet. Serialize the bark-wallet sqlite/state access
+        // against the cosign and poll loop.
+        let invoice = {
+            let _wallet_db_guard = self.wallet_db_lock.lock().await;
+            self.wallet
+                .bolt11_invoice(amount, bolt11_options.description)
+                .await
+                .map_err(|e| {
+                    cdk_common::payment::Error::Custom(format!("Failed to create invoice: {}", e))
+                })?
+        };
 
         // Extract payment hash from the invoice - bark returns lightning_invoice::Bolt11Invoice
         let payment_hash_bytes: [u8; 32] = *invoice.payment_hash().as_ref();
@@ -1722,16 +2304,19 @@ impl MintPayment for ArkBackend {
                 let address = self.parse_bitcoin_address(&opts.address)?;
                 let amount_sat = opts.amount.to_u64();
                 let amount = bitcoin::Amount::from_sat(amount_sat);
-                let estimate = self
-                    .wallet
-                    .estimate_send_onchain(&address, amount)
-                    .await
-                    .map_err(|e| {
-                        cdk_common::payment::Error::Custom(format!(
-                            "Failed to estimate onchain payment: {}",
-                            e
-                        ))
-                    })?;
+                // Serialize the bark-wallet sqlite/state read against the cosign and poll loop.
+                let estimate = {
+                    let _wallet_db_guard = self.wallet_db_lock.lock().await;
+                    self.wallet
+                        .estimate_send_onchain(&address, amount)
+                        .await
+                        .map_err(|e| {
+                            cdk_common::payment::Error::Custom(format!(
+                                "Failed to estimate onchain payment: {}",
+                                e
+                            ))
+                        })?
+                };
                 let fee_sat = estimate.fee.to_sat();
                 let fee_options = vec![MeltQuoteOnchainFeeOption {
                     fee_index: ONCHAIN_FEE_INDEX,
@@ -1787,16 +2372,19 @@ impl MintPayment for ArkBackend {
                 let address_str = address.to_string();
                 let amount_sat = opts.amount.to_u64();
                 let amount = bitcoin::Amount::from_sat(amount_sat);
-                let estimate = self
-                    .wallet
-                    .estimate_send_onchain(&address, amount)
-                    .await
-                    .map_err(|e| {
-                        cdk_common::payment::Error::Custom(format!(
-                            "Failed to estimate onchain payment: {}",
-                            e
-                        ))
-                    })?;
+                // Serialize the bark-wallet sqlite/state read against the cosign and poll loop.
+                let estimate = {
+                    let _wallet_db_guard = self.wallet_db_lock.lock().await;
+                    self.wallet
+                        .estimate_send_onchain(&address, amount)
+                        .await
+                        .map_err(|e| {
+                            cdk_common::payment::Error::Custom(format!(
+                                "Failed to estimate onchain payment: {}",
+                                e
+                            ))
+                        })?
+                };
 
                 if let Some(max_fee) = opts.max_fee_amount.as_ref() {
                     let max_fee_sat = max_fee.clone().to_u64();
@@ -1823,7 +2411,13 @@ impl MintPayment for ArkBackend {
                 };
                 self.state_store.put_send(&quote_id_str, &send_intent)?;
 
-                let txid = match self.wallet.send_onchain(address, amount).await {
+                // Serialize the bark-wallet send (sqlite/state mutation) against the cosign and
+                // poll loop.
+                let send_onchain_result = {
+                    let _wallet_db_guard = self.wallet_db_lock.lock().await;
+                    self.wallet.send_onchain(address, amount).await
+                };
+                let txid = match send_onchain_result {
                     Ok(txid) => txid,
                     Err(e) => {
                         let reason = e.to_string();
@@ -1932,17 +2526,24 @@ impl MintPayment for ArkBackend {
         self.state_store
             .put_lightning_send(&payment_hash_hex, &send_intent)?;
 
-        if let Err(e) = self
-            .wallet
-            .pay_lightning_invoice(invoice_str.as_str(), None, false)
-            .await
-        {
-            let reason = e.to_string();
-            match self
-                .wallet
-                .check_lightning_payment(PaymentHash::from(payment_hash), false)
+        // Serialize the bark-wallet pay attempt (sqlite/state mutation) against the cosign and
+        // poll loop.
+        let pay_result = {
+            let _wallet_db_guard = self.wallet_db_lock.lock().await;
+            self.wallet
+                .pay_lightning_invoice(invoice_str.as_str(), None, false)
                 .await
-            {
+        };
+        if let Err(e) = pay_result {
+            let reason = e.to_string();
+            // Serialize the bark-wallet status read against the cosign and poll loop.
+            let recovery_state = {
+                let _wallet_db_guard = self.wallet_db_lock.lock().await;
+                self.wallet
+                    .check_lightning_payment(PaymentHash::from(payment_hash), false)
+                    .await
+            };
+            match recovery_state {
                 Ok(state)
                     if !matches!(
                         state,
@@ -1971,11 +2572,14 @@ impl MintPayment for ArkBackend {
             )));
         }
 
-        let state = self
-            .wallet
-            .check_lightning_payment(PaymentHash::from(payment_hash), false)
-            .await
-            .unwrap_or(bark::actions::lightning::pay::LightningSendState::Unknown);
+        // Serialize the bark-wallet status read against the cosign and poll loop.
+        let state = {
+            let _wallet_db_guard = self.wallet_db_lock.lock().await;
+            self.wallet
+                .check_lightning_payment(PaymentHash::from(payment_hash), false)
+                .await
+                .unwrap_or(bark::actions::lightning::pay::LightningSendState::Unknown)
+        };
         let updated_send = Self::lightning_intent_from_bark_send(send_intent, &state);
         self.state_store
             .put_lightning_send(&payment_hash_hex, &updated_send)?;
@@ -2010,17 +2614,24 @@ impl MintPayment for ArkBackend {
                 // Wait for the polling interval
                 tokio::time::sleep(Duration::from_secs(5)).await;
 
-                // Try to claim all lightning receives (non-blocking)
-                if let Err(e) = wallet.try_claim_all_lightning_receives(false).await {
-                    debug!("Failed to claim lightning receives: {}", e);
-                }
+                // Serialize the bark-wallet sqlite/state access (claim + pending list) against the
+                // cosign and poll loop. Released before the per-receive bookkeeping and the
+                // next_* event helpers below (which acquire the lock themselves).
+                let pending = {
+                    let _wallet_db_guard = backend.wallet_db_lock.lock().await;
 
-                // Get pending lightning receives
-                let pending = match wallet.pending_lightning_receives().await {
-                    Ok(pending) => pending,
-                    Err(e) => {
-                        debug!("Failed to get pending receives: {}", e);
-                        Vec::new()
+                    // Try to claim all lightning receives (non-blocking)
+                    if let Err(e) = wallet.try_claim_all_lightning_receives(false).await {
+                        debug!("Failed to claim lightning receives: {}", e);
+                    }
+
+                    // Get pending lightning receives
+                    match wallet.pending_lightning_receives().await {
+                        Ok(pending) => pending,
+                        Err(e) => {
+                            debug!("Failed to get pending receives: {}", e);
+                            Vec::new()
+                        }
                     }
                 };
 

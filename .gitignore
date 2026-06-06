@@ -1,7 +1,11 @@
 /target
-.idea/
-*.pem
+**/target
+*.seed
 *.key
-*.crt
-.pre-commit-config.yaml
-.data
+*.sqlite
+*.sqlite-*
+*.redb
+*.bak
+*.canary-proven.bak
+enclave-run-processor.reference.sh
+*.log

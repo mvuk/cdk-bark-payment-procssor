@@ -14,6 +14,12 @@ pub struct BackendConfig {
     #[serde(default = "default_server_address")]
     pub server_address: String,
 
+    /// Ark server access token. Mainnet `ark.second.tech` is access-token-gated; when set this is
+    /// passed to bark's `Config::server_access_token` so the gRPC client sends it. Empty/unset on
+    /// the local Mutinynet/regtest setup (no token required). Set via `ARK_SERVER_ACCESS_TOKEN`.
+    #[serde(default)]
+    pub server_access_token: String,
+
     /// Esplora API address
     #[serde(default = "default_esplora_address")]
     pub esplora_address: String,
@@ -37,6 +43,61 @@ pub struct BackendConfig {
     /// Bitcoind RPC password
     #[serde(default = "default_bitcoind_pass")]
     pub bitcoind_pass: String,
+
+    /// Payjoin directory URL (v2 store-and-forward server).
+    #[serde(default = "default_payjoin_directory_url")]
+    pub payjoin_directory_url: String,
+
+    /// OHTTP relay URL used to encapsulate payjoin requests to the directory.
+    #[serde(default = "default_payjoin_ohttp_relay")]
+    pub payjoin_ohttp_relay: String,
+
+    /// OHTTP keys (bech32 `OH1...` string). If empty, they are fetched from the directory
+    /// via the relay at startup.
+    #[serde(default)]
+    pub payjoin_ohttp_keys: String,
+
+    /// Telemetry control URL for the on-ramp dashboard (POST `${control_url}/onramp/event`).
+    #[serde(default = "default_control_url")]
+    pub control_url: String,
+
+    /// "Tier 2" payjoin boarding: when true, the mint (receiver) contributes its OWN on-chain
+    /// input(s) to the payjoin board, turning the 1-input board into a real multi-input payjoin.
+    /// Default false (Tier 3, zero receiver inputs — existing behavior). Toggled via the
+    /// `PAYJOIN_RECEIVER_INPUTS` env var ("1"/"true").
+    #[serde(default)]
+    pub payjoin_receiver_inputs: bool,
+
+    /// Number of mint UTXOs to contribute to a payjoin board when `payjoin_receiver_inputs` is on.
+    /// The sender's single input becomes one-of-many so a chain observer cannot pick out the
+    /// depositor's input. Clamped to the number of available UNLOCKED mint UTXOs; if zero are
+    /// available the board falls back to the zero-input (Tier 3) path. Default 2. Set via the
+    /// `PAYJOIN_RECEIVER_INPUT_COUNT` env var.
+    #[serde(default = "default_payjoin_receiver_input_count")]
+    pub payjoin_receiver_input_count: u32,
+
+    /// The mint's own on-chain deposit (board) fee, in basis points of the user's deposit D.
+    /// Deducted from the credited ecash; the fee stays inside the board VTXO as mint reserve, so
+    /// total solvency is preserved by construction. Default 0 (no fee). Set via the
+    /// `MINT_ONCHAIN_DEPOSIT_FEE_BPS` env var (e.g. 50 = 0.50%).
+    #[serde(default)]
+    pub payjoin_onchain_deposit_fee_bps: u64,
+}
+
+fn default_payjoin_receiver_input_count() -> u32 {
+    2
+}
+
+fn default_payjoin_directory_url() -> String {
+    "https://payjo.in".to_string()
+}
+
+fn default_payjoin_ohttp_relay() -> String {
+    "https://pj.bobspacebkk.com".to_string()
+}
+
+fn default_control_url() -> String {
+    "http://127.0.0.1:9201".to_string()
 }
 
 fn default_server_address() -> String {
@@ -72,12 +133,20 @@ impl Default for BackendConfig {
         Self {
             mnemonic: String::new(),
             server_address: default_server_address(),
+            server_access_token: String::new(),
             esplora_address: default_esplora_address(),
             network: default_network(),
             data_dir: default_data_dir(),
             bitcoind_address: default_bitcoind_address(),
             bitcoind_user: default_bitcoind_user(),
             bitcoind_pass: default_bitcoind_pass(),
+            payjoin_directory_url: default_payjoin_directory_url(),
+            payjoin_ohttp_relay: default_payjoin_ohttp_relay(),
+            payjoin_ohttp_keys: String::new(),
+            control_url: default_control_url(),
+            payjoin_receiver_inputs: false,
+            payjoin_receiver_input_count: default_payjoin_receiver_input_count(),
+            payjoin_onchain_deposit_fee_bps: 0,
         }
     }
 }
@@ -146,11 +215,22 @@ impl Config {
         let mut cfg: Config = fig.extract().unwrap_or_default();
 
         // 2) Overlay environment variables explicitly
-        if let Ok(v) = std::env::var("MNEMONIC") {
+        // Seed precedence: MNEMONIC_FILE (a path; read + trim) wins over the inline MNEMONIC value
+        // so the seed can be injected via a file (Key Vault / tmpfs) rather than a process-visible
+        // env value. Falls back to MNEMONIC when MNEMONIC_FILE is unset.
+        if let Ok(path) = std::env::var("MNEMONIC_FILE") {
+            match std::fs::read_to_string(&path) {
+                Ok(contents) => cfg.backend.mnemonic = contents.trim().to_string(),
+                Err(e) => panic!("Failed to read MNEMONIC_FILE '{}': {}", path, e),
+            }
+        } else if let Ok(v) = std::env::var("MNEMONIC") {
             cfg.backend.mnemonic = v;
         }
         if let Ok(v) = std::env::var("ARK_SERVER_ADDRESS") {
             cfg.backend.server_address = v;
+        }
+        if let Ok(v) = std::env::var("ARK_SERVER_ACCESS_TOKEN") {
+            cfg.backend.server_access_token = v;
         }
         if let Ok(v) = std::env::var("ESPLORA_ADDRESS") {
             cfg.backend.esplora_address = v;
@@ -172,6 +252,32 @@ impl Config {
         }
         if let Ok(v) = std::env::var("TLS_KEY_PATH") {
             cfg.tls_key_path = v;
+        }
+        if let Ok(v) = std::env::var("PAYJOIN_DIRECTORY_URL") {
+            cfg.backend.payjoin_directory_url = v;
+        }
+        if let Ok(v) = std::env::var("PAYJOIN_OHTTP_RELAY") {
+            cfg.backend.payjoin_ohttp_relay = v;
+        }
+        if let Ok(v) = std::env::var("PAYJOIN_OHTTP_KEYS") {
+            cfg.backend.payjoin_ohttp_keys = v;
+        }
+        if let Ok(v) = std::env::var("CONTROL_URL") {
+            cfg.backend.control_url = v;
+        }
+        if let Ok(v) = std::env::var("PAYJOIN_RECEIVER_INPUTS") {
+            cfg.backend.payjoin_receiver_inputs =
+                matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES");
+        }
+        if let Ok(v) = std::env::var("PAYJOIN_RECEIVER_INPUT_COUNT") {
+            if let Ok(n) = v.parse::<u32>() {
+                cfg.backend.payjoin_receiver_input_count = n;
+            }
+        }
+        if let Ok(v) = std::env::var("MINT_ONCHAIN_DEPOSIT_FEE_BPS") {
+            if let Ok(n) = v.parse::<u64>() {
+                cfg.backend.payjoin_onchain_deposit_fee_bps = n;
+            }
         }
 
         cfg

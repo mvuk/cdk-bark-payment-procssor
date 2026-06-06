@@ -1,5 +1,8 @@
 mod ark_backend;
+mod payjoin_receiver;
+mod payjoin_state;
 mod settings;
+mod telemetry;
 
 use crate::ark_backend::ArkBackend;
 use anyhow::Result;
@@ -21,9 +24,73 @@ async fn main() -> Result<()> {
     tracing::info!("Initializing Ark payment processor");
     let backend = Arc::new(ArkBackend::new(&cfg.backend).await?);
 
+    // One-shot recycler-primitive validation (env-gated). Moves a SMALL amount of the mint's own
+    // Ark reserve to a fresh on-chain address to prove the offboard path (and reveal confirmation
+    // timing) before the unattended recycler loop is wired. Spawned so it never blocks startup.
+    if let Ok(v) = std::env::var("RECYCLER_TEST_OFFBOARD_SAT") {
+        if let Ok(amt) = v.parse::<u64>() {
+            let b = backend.clone();
+            tokio::spawn(async move {
+                tracing::warn!("RECYCLER_TEST_OFFBOARD_SAT={amt}: performing ONE test offboard");
+                match b.recycle_test_offboard(amt).await {
+                    Ok(txid) => tracing::warn!("recycle test offboard OK: txid {txid}"),
+                    Err(e) => tracing::error!("recycle test offboard FAILED: {e:#}"),
+                }
+            });
+        }
+    }
+
+    // One-shot reserve splitter (env-gated). Splits the on-chain reserve into many small randomized
+    // 5-20k UTXOs so Tier-2 boards lend a small random amount per board. `RECYCLER_SPLIT_NOW=1`.
+    // Range overridable via MINT_LEND_MIN_SAT / MINT_LEND_MAX_SAT (default 5000 / 20000).
+    if std::env::var("RECYCLER_SPLIT_NOW").map(|v| v == "1" || v == "true").unwrap_or(false) {
+        let b = backend.clone();
+        let min_sat = std::env::var("MINT_LEND_MIN_SAT").ok().and_then(|v| v.parse().ok()).unwrap_or(5000u64);
+        let max_sat = std::env::var("MINT_LEND_MAX_SAT").ok().and_then(|v| v.parse().ok()).unwrap_or(20000u64);
+        tokio::spawn(async move {
+            tracing::warn!("RECYCLER_SPLIT_NOW set: splitting reserve into {min_sat}-{max_sat} sat UTXOs");
+            match b.split_reserve(min_sat, max_sat).await {
+                Ok(txid) => tracing::warn!("split_reserve OK: txid {txid}"),
+                Err(e) => tracing::error!("split_reserve FAILED: {e:#}"),
+            }
+        });
+    }
+
     let bind_addr = "0.0.0.0";
     let server_addr = format!("{}:{}", bind_addr, cfg.server_port);
     tracing::info!("Starting CDK Payment Processor server on {}", server_addr);
+
+    // Spawn the on-ramp payjoin poll loop. It drives all active payjoin sessions forward
+    // (poll directory -> walk typestate -> cosign+store board -> post proposal -> monitor) and
+    // reconciles confirmed boards for crediting. Errors are logged inside `poll_onramp`.
+    {
+        let onramp_backend = backend.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                onramp_backend.poll_onramp().await;
+            }
+        });
+    }
+
+    // Spawn the VTXO maintenance loop. Custody VTXOs (the funds backing issued ecash) expire
+    // after `vtxo_lifetime` blocks; missing the refresh window forces an expensive unilateral
+    // exit. The cadence must sit well inside bark's refresh threshold — 12 blocks (~6 min) on
+    // Mutinynet's 30s blocks — so we run every 5 minutes. Delegated mode only schedules the
+    // refresh with the server (cheap, usually a no-op) and never blocks on round completion.
+    {
+        let maintenance_backend = backend.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+            loop {
+                interval.tick().await;
+                if let Err(e) = maintenance_backend.run_maintenance().await {
+                    tracing::warn!("VTXO maintenance error: {e:#}");
+                }
+            }
+        });
+    }
 
     let mut server =
         cdk_payment_processor::PaymentProcessorServer::new(backend, bind_addr, cfg.server_port)?;
