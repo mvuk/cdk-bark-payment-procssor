@@ -102,43 +102,34 @@ async fn main() -> Result<()> {
     //   POR_ENABLE=1        run the attestation on a timer (every POR_INTERVAL_SECS,
     //                       default ~6000s ≈ 10 mainnet blocks); POR_PUBLISH gates Nostr.
     //
-    // The attest key is loaded from env POR_ATTEST_SECKEY (hex) or ~/secrets/por-attest.seckey.
-    // If absent, the gated features no-op and log (binding attest pubkey <-> cdk
-    // MintInfo is a documented fast-follow).
+    // The attestation key is now the WALLET's keypair at the STABLE attestation index
+    // (the key that OWNS the arkoor self-spend output). It is derived inside
+    // build_attestation from POR_ATTEST_INDEX / ~/secrets/por-attest.index, bootstrapping
+    // a fresh stable index on first run. No standalone secret to load.
     {
         let want_once = std::env::var("POR_ATTEST_ONCE").map(|v| v == "1" || v == "true").unwrap_or(false);
         let want_timer = std::env::var("POR_ENABLE").map(|v| v == "1" || v == "true").unwrap_or(false);
         if want_once || want_timer {
-            match por::load_attest_key() {
-                Ok(Some(attest_key)) => {
-                    let publish = std::env::var("POR_PUBLISH").map(|v| v == "1" || v == "true").unwrap_or(false);
-                    tracing::warn!(
-                        "PoR ENABLED (once={want_once} timer={want_timer} publish={publish}); attest pubkey {}",
-                        por::attest_pubkey_xonly_hex(&attest_key)
-                    );
-                    if want_once {
-                        let b = backend.clone();
-                        let key = attest_key;
-                        let timer = want_timer;
-                        tokio::spawn(async move {
-                            if let Err(e) = b.run_por_attestation(&key, publish).await {
-                                tracing::error!("PoR one-shot attestation FAILED: {e:#}");
-                            }
-                            if timer {
-                                por_timer_loop(b, key, publish).await;
-                            }
-                        });
-                    } else {
-                        // timer only
-                        let b = backend.clone();
-                        tokio::spawn(async move { por_timer_loop(b, attest_key, publish).await });
+            let publish = std::env::var("POR_PUBLISH").map(|v| v == "1" || v == "true").unwrap_or(false);
+            tracing::warn!(
+                "PoR ENABLED (once={want_once} timer={want_timer} publish={publish}); \
+                 attestation key = wallet stable attestation index (derived at build time)"
+            );
+            if want_once {
+                let b = backend.clone();
+                let timer = want_timer;
+                tokio::spawn(async move {
+                    if let Err(e) = b.run_por_attestation(publish).await {
+                        tracing::error!("PoR one-shot attestation FAILED: {e:#}");
                     }
-                }
-                Ok(None) => tracing::warn!(
-                    "PoR requested (POR_ATTEST_ONCE/POR_ENABLE) but no attest key found \
-                     (set POR_ATTEST_SECKEY hex or ~/secrets/por-attest.seckey); PoR no-op"
-                ),
-                Err(e) => tracing::error!("PoR attest key load failed: {e:#}; PoR no-op"),
+                    if timer {
+                        por_timer_loop(b, publish).await;
+                    }
+                });
+            } else {
+                // timer only
+                let b = backend.clone();
+                tokio::spawn(async move { por_timer_loop(b, publish).await });
             }
         }
     }
@@ -161,7 +152,7 @@ async fn main() -> Result<()> {
 
 /// PoR timer loop: rebuild + (optionally) publish an attestation every
 /// `POR_INTERVAL_SECS` (default ~6000s ≈ 10 mainnet blocks). Env-gated by the caller.
-async fn por_timer_loop(backend: Arc<ArkBackend>, attest_key: por::AttestKey, publish: bool) {
+async fn por_timer_loop(backend: Arc<ArkBackend>, publish: bool) {
     let secs = std::env::var("POR_INTERVAL_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -173,7 +164,7 @@ async fn por_timer_loop(backend: Arc<ArkBackend>, attest_key: por::AttestKey, pu
     interval.tick().await;
     loop {
         interval.tick().await;
-        if let Err(e) = backend.run_por_attestation(&attest_key, publish).await {
+        if let Err(e) = backend.run_por_attestation(publish).await {
             tracing::error!("PoR timer attestation FAILED: {e:#}");
         }
     }
