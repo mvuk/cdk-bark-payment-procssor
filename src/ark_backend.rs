@@ -1049,7 +1049,7 @@ impl ArkBackend {
     /// VTXOs; it is invoked only from the ENV-GATED hooks in `main.rs` (off by
     /// default). Holds `wallet_db_lock` only around the wallet/sqlite work, matching
     /// the rest of the backend's lock discipline.
-    pub async fn run_por_attestation(&self, attest_key: &crate::por::AttestKey, publish: bool) -> anyhow::Result<()> {
+    pub async fn run_por_attestation(&self, publish: bool) -> anyhow::Result<()> {
         let esplora_base = std::env::var("POR_ESPLORA")
             .ok()
             .filter(|v| !v.trim().is_empty())
@@ -1058,7 +1058,7 @@ impl ArkBackend {
         let result = {
             // self-spend arkoors touch the bark sqlite — serialize against the cosign path.
             let _wallet_db_guard = self.wallet_db_lock.lock().await;
-            crate::por::build_attestation(&self.wallet, attest_key, &esplora_base).await?
+            crate::por::build_attestation(&self.wallet, &esplora_base).await?
         };
 
         let path = crate::por::write_bundle_file(&result.bundle_json)?;
@@ -1066,7 +1066,9 @@ impl ArkBackend {
 
         let (event_id, url) = if publish {
             let relays = crate::por::nostr_relays_from_env();
-            match crate::por::publish_nostr(&result, attest_key, &relays).await {
+            // sign the Nostr events with the SAME wallet attestation key that owns the
+            // arkoor outputs + signed the bundle (owner == signer).
+            match crate::por::publish_nostr(&result, &result.attest_key, &relays).await {
                 Ok(id) => (Some(id), Some("https://mint.nordic.cash/audit/latest.json".to_string())),
                 Err(e) => {
                     tracing::warn!("PoR: Nostr publish failed (bundle still written): {e:#}");
