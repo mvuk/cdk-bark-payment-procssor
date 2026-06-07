@@ -243,6 +243,23 @@ pub async fn build_attestation(
         .await
         .context("enumerate spendable reserve vtxos")?;
 
+    // OPTIONAL single-VTXO filter (env-gated, off by default) for a bounded first live
+    // test. When `POR_ATTEST_VTXO_ID` is set (format `txid:vout`, the same string form as
+    // a reserve VTXO's `id().to_string()` — identical to the bundle entry's `vtxo_id`,
+    // which is also `id().to_string()`), attest ONLY the spendable reserve VTXO whose id
+    // matches; skip all others. When unset, behavior is unchanged (attest all spendable
+    // reserve VTXOs). If set but nothing matches, we attest NOTHING (and warn) rather than
+    // self-spend the wrong coin.
+    let target_vtxo_id: Option<String> = std::env::var("POR_ATTEST_VTXO_ID")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(ref id) = target_vtxo_id {
+        tracing::warn!(
+            "PoR: POR_ATTEST_VTXO_ID={id} set — attesting ONLY the matching reserve VTXO (all others skipped)"
+        );
+    }
+
     tracing::info!(
         "PoR: building attestation over {} spendable reserve VTXO(s) to stable index {} (pubkey {})",
         reserve.len(),
@@ -252,8 +269,20 @@ pub async fn build_attestation(
 
     let mut entries: Vec<ReserveEntry> = Vec::with_capacity(reserve.len());
     let mut total_sat: u64 = 0;
+    let mut matched_target = false;
 
     for wv in &reserve {
+        // Single-VTXO filter: skip every reserve VTXO whose id != the targeted one. The
+        // input reserve VTXO's id (`wv.vtxo.id().to_string()`) uses the SAME formatting as
+        // the bundle entry's `vtxo_id` below (`out.id().to_string()`), so the env value is
+        // compared in that exact string form.
+        if let Some(ref id) = target_vtxo_id {
+            if wv.vtxo.id().to_string() != *id {
+                continue;
+            }
+            matched_target = true;
+        }
+
         // `wv.vtxo` is a Vtxo<Bare> (no genesis) — cannot be serialized into a bundle.
         // We self-spend it to the STABLE wallet attestation address; the returned
         // finalized Vtxo<Full> (the arkoor DESTINATION output) carries the full genesis
@@ -321,6 +350,19 @@ pub async fn build_attestation(
             vtxo_hex: out.serialize_hex(),
             anchor_tx_hex,
         });
+    }
+
+    // Filter set but no spendable reserve VTXO matched: produce NO attestation rather than
+    // attest the wrong coin. (Without this guard we'd emit an empty/zero-sat bundle.)
+    if let Some(ref id) = target_vtxo_id {
+        if !matched_target {
+            tracing::warn!(
+                "PoR: POR_ATTEST_VTXO_ID={id} did not match any spendable reserve VTXO ({} candidates) — \
+                 producing NO attestation (refusing to attest the wrong VTXO)",
+                reserve.len()
+            );
+            bail!("POR_ATTEST_VTXO_ID={id} matched no spendable reserve VTXO; no attestation produced");
+        }
     }
 
     let as_of_block = fetch_as_of_block(esplora_base)
