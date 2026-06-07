@@ -59,6 +59,8 @@ pub struct ArkBackend {
     /// mint quotes at CREATION time (before any payjoin session/URI is issued), instead of taking
     /// the payment and failing silently later in `cosign_and_store_board`.
     min_board_amount_sat: u64,
+    /// Esplora API base (from config), used by the PoR prover for the freshness tip.
+    esplora_address: String,
     wait_invoice_active: Arc<AtomicBool>,
     /// On-ramp payjoin receiver runner (on-chain -> ecash via board).
     payjoin: PayjoinReceiver,
@@ -969,6 +971,7 @@ impl ArkBackend {
             state_store,
             network,
             min_board_amount_sat,
+            esplora_address: config.esplora_address.clone(),
             wait_invoice_active: Arc::new(AtomicBool::new(false)),
             payjoin,
             telemetry,
@@ -1040,6 +1043,48 @@ impl ArkBackend {
         // around the bark wallet call so a payjoin cosign is never starved.
         let _wallet_db_guard = self.wallet_db_lock.lock().await;
         self.wallet.maintenance_delegated().await
+    }
+
+    /// Build a proof-of-reserves attestation over the mint's current reserve, write
+    /// the bundle to disk (for `/audit/latest.json`), append the ledger line, and —
+    /// only if `publish` — broadcast it over Nostr.
+    ///
+    /// HONEST FRAMING: this is **proof of reserves** (a lower bound on assets), NOT
+    /// solvency. It performs free, value-preserving arkoor self-spends of the reserve
+    /// VTXOs; it is invoked only from the ENV-GATED hooks in `main.rs` (off by
+    /// default). Holds `wallet_db_lock` only around the wallet/sqlite work, matching
+    /// the rest of the backend's lock discipline.
+    pub async fn run_por_attestation(&self, attest_key: &crate::por::AttestKey, publish: bool) -> anyhow::Result<()> {
+        let esplora_base = std::env::var("POR_ESPLORA")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| self.esplora_address.clone());
+
+        let result = {
+            // self-spend arkoors touch the bark sqlite — serialize against the cosign path.
+            let _wallet_db_guard = self.wallet_db_lock.lock().await;
+            crate::por::build_attestation(&self.wallet, attest_key, &esplora_base).await?
+        };
+
+        let path = crate::por::write_bundle_file(&result.bundle_json)?;
+        tracing::info!("PoR: wrote bundle to {}", path.display());
+
+        let (event_id, url) = if publish {
+            let relays = crate::por::nostr_relays_from_env();
+            match crate::por::publish_nostr(&result, attest_key, &relays).await {
+                Ok(id) => (Some(id), Some("https://your-mint.example/audit/latest.json".to_string())),
+                Err(e) => {
+                    tracing::warn!("PoR: Nostr publish failed (bundle still written): {e:#}");
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
+
+        let ledger = crate::por::append_ledger(&result, event_id.as_deref(), url.as_deref())?;
+        tracing::info!("PoR: appended ledger {}", ledger.display());
+        Ok(())
     }
 
     /// One-shot manual offboard, env-gated from `main.rs` (`RECYCLER_TEST_OFFBOARD_SAT`). Offboards

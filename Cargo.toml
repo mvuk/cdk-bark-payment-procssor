@@ -18,6 +18,12 @@ bark-bitcoin-ext = { git = "https://gitlab.com/matthewvuk/shepherd.git" }
 bark-wallet = { git = "https://gitlab.com/matthewvuk/shepherd.git", features = ["onchain-bdk"] }
 # rust-payjoin v2 receiver (local clone). v2 + io give us the typestate flow and reqwest helpers.
 payjoin = { git = "https://github.com/payjoin/rust-payjoin", rev = "fb884d11996acea9d9bd5573b32b549b1bfdc334", features = ["v2", "io"] }
+# Proof-of-Reserves bundle schema (shared, byte-for-byte canonical() with the verifier).
+ark-audit-shared = { git = "https://gitlab.com/matthewvuk/ark-audit-shared.git" }
+# Nostr publisher for PoR (kind-30078 latest + kind-78 history). Pinned to 0.44.x to match
+# cdk's vendored nostr-sdk (NORDIC-POR-CONFIRMED-FACTS §6). default-features off; nip44 + nip59
+# not needed for plain signed-event publish.
+nostr-sdk = { version = "0.44", default-features = false }
 bip39 = "2.0"
 bitcoin = "0.32"
 hex = "0.4"
