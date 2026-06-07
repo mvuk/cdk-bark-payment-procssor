@@ -1094,7 +1094,8 @@ impl ArkBackend {
             let mut h = s.build_hasher();
             h.write_u64(i);
             h.write_u64(allocated);
-            let amt = min_sat + (h.finish() % (hi - min_sat + 1));
+            let raw = min_sat + (h.finish() % (hi - min_sat + 1));
+            let amt = (raw / 100) * 100; // round to a multiple of 100 — lend UTXOs end in "00"
             let addr = oc.address().await?;
             dests.push((addr, bitcoin::Amount::from_sat(amt)));
             allocated += amt;
