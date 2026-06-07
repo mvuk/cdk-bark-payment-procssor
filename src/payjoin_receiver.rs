@@ -796,6 +796,14 @@ impl PayjoinReceiver {
     ) -> Vec<(InputPair, OutPoint)> {
         let target = self.receiver_input_count.max(1) as usize;
 
+        // Only contribute mint inputs in [lend_min, lend_max] so a board's obscuring input is
+        // ALWAYS a clean, peer-sized UTXO (never a tiny leftover/change). Matches the splitter
+        // range; for demos this keeps inputs/outputs similar in size. Env-tunable.
+        let lend_min: u64 = std::env::var("MINT_LEND_MIN_SAT")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(45_000);
+        let lend_max: u64 = std::env::var("MINT_LEND_MAX_SAT")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(65_000);
+
         // Durable lock set (survives restarts), unioned with the in-memory same-process set.
         let durable_locked = self.state.locked_utxos().unwrap_or_default();
 
@@ -809,7 +817,10 @@ impl PayjoinReceiver {
             utxos
                 .into_iter()
                 .filter(|o| {
+                    let v = o.txout.value.to_sat();
                     !o.is_spent
+                        && v >= lend_min
+                        && v <= lend_max
                         && !locked.contains(&o.outpoint)
                         && !durable_locked.contains(&o.outpoint.to_string())
                 })
