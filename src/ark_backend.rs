@@ -33,7 +33,7 @@ use crate::payjoin_state::{OnRampQuoteRecord, OnRampStateStore};
 use crate::settings::BackendConfig;
 use crate::telemetry::{OnRampEvent, OnRampStage, TelemetryClient};
 
-const ONCHAIN_CONFIRMATIONS: u32 = 1;
+const ONCHAIN_CONFIRMATIONS: u32 = 6;
 const ONCHAIN_FEE_INDEX: u32 = 0;
 const ONCHAIN_ESTIMATED_BLOCKS: u32 = 6;
 
@@ -89,6 +89,11 @@ const COMPLETED_LIGHTNING_SENDS_TABLE: TableDefinition<&str, &str> =
 
 const RETRY_BACKOFF_SECS: u64 = 30;
 const SEND_ATTEMPT_REVIEW_SECS: u64 = 60;
+/// A confirmed board normally finalizes within ~1h (6 confs). If a `Boarding`
+/// intent's VTXO still isn't Spendable after this generous window, it's wedged —
+/// escalate it to NeedsReview so an operator is signalled instead of it looping
+/// silently forever (the stuck-funds failure mode).
+const BOARD_FINALIZE_REVIEW_SECS: u64 = 6 * 60 * 60;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct OnchainReceiveIntentRecord {
@@ -1148,7 +1153,7 @@ impl ArkBackend {
         let _wallet_db_guard = self.wallet_db_lock.lock().await;
 
         if let Err(e) = self.wallet.sync_pending_boards().await {
-            debug!("Failed to sync pending boards: {}", e);
+            warn!("Failed to sync pending boards: {}", e);
         }
 
         let tip = self.wallet.chain().tip().await.map_err(|e| {
@@ -1396,6 +1401,26 @@ impl ArkBackend {
         Ok(())
     }
 
+    /// Move a stuck/broken on-chain receive (board) intent to NeedsReview so an
+    /// operator is signalled, instead of it looping silently in `Boarding` forever.
+    fn escalate_receive_to_review(
+        &self,
+        intent: &OnchainReceiveIntentRecord,
+        reason: String,
+    ) -> Result<(), cdk_common::payment::Error> {
+        let mut needs_review = intent.clone();
+        needs_review.state = OnchainReceiveIntentState::NeedsReview {
+            reason: reason.clone(),
+            failed_at: Self::unix_now(),
+        };
+        self.state_store.put_receive_intent(&needs_review)?;
+        warn!(
+            "onchain receive {} for quote {} escalated to NeedsReview: {}",
+            intent.deposit_outpoint, intent.quote_id, reason
+        );
+        Ok(())
+    }
+
     async fn finalize_spendable_receive_boards(&self) -> Result<(), cdk_common::payment::Error> {
         'intents: for intent in self.state_store.receive_intents()? {
             let OnchainReceiveIntentState::Boarding {
@@ -1403,29 +1428,61 @@ impl ArkBackend {
                 board_vtxo_ids,
                 fee_sat,
                 amount_sat,
+                started_at,
                 ..
             } = &intent.state
             else {
                 continue;
             };
 
+            // A board that confirmed on-chain but whose VTXO never becomes Spendable
+            // (server stall, rebroadcast wedge, malformed stored id) would otherwise
+            // sit in `Boarding` forever with no operator signal. After a generous
+            // window (well beyond the ~1h / 6-conf normal finalization) escalate it.
+            let now = Self::unix_now();
+            let stuck = started_at.saturating_add(BOARD_FINALIZE_REVIEW_SECS) <= now;
+
             for vtxo_id in board_vtxo_ids {
-                let vtxo_id = match VtxoId::from_str(vtxo_id) {
-                    Ok(vtxo_id) => vtxo_id,
+                let parsed = match VtxoId::from_str(vtxo_id) {
+                    Ok(parsed) => parsed,
                     Err(e) => {
-                        warn!("Invalid stored board vtxo id {}: {}", vtxo_id, e);
+                        // A malformed stored id is a permanent error, not a wait —
+                        // escalate immediately rather than silently looping forever.
+                        self.escalate_receive_to_review(
+                            &intent,
+                            format!("invalid stored board vtxo id {}: {}", vtxo_id, e),
+                        )?;
                         continue 'intents;
                     }
                 };
-                let vtxo = match self.wallet.get_vtxo_by_id(vtxo_id).await {
+                let vtxo = match self.wallet.get_vtxo_by_id(parsed).await {
                     Ok(vtxo) => vtxo,
                     Err(e) => {
-                        debug!("Board vtxo {} is not available yet: {}", vtxo_id, e);
+                        if stuck {
+                            self.escalate_receive_to_review(
+                                &intent,
+                                format!(
+                                    "board {} vtxo {} still unavailable after {}s: {}",
+                                    board_txid, parsed, BOARD_FINALIZE_REVIEW_SECS, e
+                                ),
+                            )?;
+                        } else {
+                            debug!("Board vtxo {} is not available yet: {}", parsed, e);
+                        }
                         continue 'intents;
                     }
                 };
 
                 if !matches!(vtxo.state.kind(), bark::vtxo::VtxoStateKind::Spendable) {
+                    if stuck {
+                        self.escalate_receive_to_review(
+                            &intent,
+                            format!(
+                                "board {} vtxo {} still not spendable after {}s",
+                                board_txid, parsed, BOARD_FINALIZE_REVIEW_SECS
+                            ),
+                        )?;
+                    }
                     continue 'intents;
                 }
             }
